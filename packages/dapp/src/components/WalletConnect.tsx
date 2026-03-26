@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import { ConnectButton, useCurrentAccount } from "@mysten/dapp-kit";
 
 export function WalletConnect({
@@ -9,14 +10,16 @@ export function WalletConnect({
 }) {
   const account = useCurrentAccount();
 
-  if (account) {
-    onConnect(account.address);
-  }
+  useEffect(() => {
+    if (account) {
+      onConnect(account.address);
+    }
+  }, [account, onConnect]);
 
   return (
     <div className="flex items-center gap-3">
       <ConnectButton
-        connectText="Connect Wallet"
+        connectText="Connect EVE Vault"
         className="!bg-ghost-surface-2 !border !border-ghost-border !text-ghost-text !rounded !px-3 !py-1.5 !text-sm hover:!border-ghost-accent"
       />
       {account && (

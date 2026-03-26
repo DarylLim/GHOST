@@ -1,5 +1,6 @@
 "use client";
 
+import { EveFrontierProvider } from "@evefrontier/dapp-kit";
 import { createNetworkConfig, SuiClientProvider, WalletProvider } from "@mysten/dapp-kit";
 import { getFullnodeUrl } from "@mysten/sui/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -16,7 +17,11 @@ export function SuiProvider({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <SuiClientProvider networks={networkConfig} defaultNetwork="mainnet">
-        <WalletProvider autoConnect>{children}</WalletProvider>
+        <WalletProvider autoConnect>
+          <EveFrontierProvider queryClient={queryClient}>
+            {children}
+          </EveFrontierProvider>
+        </WalletProvider>
       </SuiClientProvider>
     </QueryClientProvider>
   );
