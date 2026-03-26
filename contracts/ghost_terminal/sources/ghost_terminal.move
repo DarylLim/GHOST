@@ -5,225 +5,243 @@
 /// can fly to the terminal in Stillness, press F, and interact with GHOST
 /// through the in-game dApp.
 ///
-/// Architecture:
-/// - Uses typed witness pattern for SSU extension authorization
-/// - Emits events for off-chain service to track interactions
-/// - Stores per-terminal configuration on-chain
-module ghost::ghost_terminal {
-    use sui::event;
-    use sui::clock::Clock;
-    use sui::table::{Self, Table};
+/// Architecture follows the EVE Frontier builder-scaffold pattern:
+/// - Uses typed witness pattern (`GhostAuth`) for SSU extension authorization
+/// - Registers with SSU via `world::storage_unit::authorize_extension<GhostAuth>`
+/// - Can perform extension-authorized deposit/withdraw on the SSU
+/// - Emits events for the off-chain service to track interactions
+/// - Stores terminal config as dynamic fields on the shared ExtensionConfig
+#[allow(unused_use)]
+module ghost_terminal::ghost_terminal;
 
-    // ========== Error codes ==========
-    const E_NOT_AUTHORIZED: u64 = 0;
-    const E_TERMINAL_NOT_FOUND: u64 = 1;
-    const E_ALREADY_REGISTERED: u64 = 2;
+use ghost_terminal::config::{Self, AdminCap, GhostAuth, ExtensionConfig};
+use sui::clock::Clock;
+use sui::event;
+use world::{
+    access::OwnerCap,
+    character::Character,
+    storage_unit::StorageUnit,
+};
 
-    // ========== Activation types ==========
-    const ACTIVATION_OPENED: u8 = 0;
-    const ACTIVATION_QUERY: u8 = 1;
-    const ACTIVATION_ALERT_ACK: u8 = 2;
+// ========== Errors ==========
 
-    // ========== Query types ==========
-    const QUERY_STATUS: u8 = 0;
-    const QUERY_THREAT: u8 = 1;
-    const QUERY_ROUTE: u8 = 2;
-    const QUERY_TUTORIAL: u8 = 3;
+#[error(code = 0)]
+const ENoTerminalConfig: vector<u8> = b"Missing TerminalConfig on ExtensionConfig";
 
-    // ========== Witness for extension authorization ==========
-    /// One-time witness for typed auth with EVE Frontier's World framework.
-    /// Used to register this extension with Smart Storage Units.
-    public struct GHOST_TERMINAL has drop {}
+#[error(code = 1)]
+const ETerminalInactive: vector<u8> = b"Terminal is not active";
 
-    // ========== On-chain state ==========
+// ========== Config types (stored as dynamic fields) ==========
 
-    /// Registry of all GHOST terminals. Shared object.
-    public struct GhostRegistry has key {
-        id: UID,
-        /// Maps terminal SSU item ID → terminal config
-        terminals: Table<u64, TerminalConfig>,
-        /// Total activations across all terminals
-        total_activations: u64,
-        /// Admin address (deployer)
-        admin: address,
-    }
+/// Per-terminal configuration stored as a dynamic field on ExtensionConfig.
+public struct TerminalConfig has drop, store {
+    /// Human-readable terminal name
+    name: vector<u8>,
+    /// Whether the terminal is accepting interactions
+    active: bool,
+    /// Total activation count
+    activation_count: u64,
+    /// Timestamp of registration
+    registered_at: u64,
+}
 
-    /// Per-terminal configuration stored on-chain
-    public struct TerminalConfig has store, drop {
-        /// SSU item ID this terminal is attached to
-        ssu_item_id: u64,
-        /// Human-readable name
-        name: vector<u8>,
-        /// Whether the terminal is active
-        active: bool,
-        /// Total activations at this terminal
-        activation_count: u64,
-        /// Timestamp of registration
-        registered_at: u64,
-    }
+/// Dynamic-field key for TerminalConfig.
+public struct TerminalConfigKey has copy, drop, store {}
 
-    // ========== Events ==========
+// ========== Events ==========
 
-    /// Emitted when a player activates GHOST at a terminal.
-    /// The off-chain service polls for these via suix_queryEvents.
-    public struct GhostActivation has copy, drop {
-        terminal_id: u64,
-        player: address,
-        timestamp: u64,
-        activation_type: u8,
-    }
+/// Emitted when a player activates GHOST at a terminal.
+/// The off-chain service polls for these via suix_queryEvents.
+public struct GhostActivation has copy, drop {
+    terminal_obj_id: address,
+    player: address,
+    timestamp: u64,
+    activation_type: u8,
+}
 
-    /// Emitted when a player submits a query through GHOST.
-    /// Allows the off-chain service to track query patterns.
-    public struct GhostQuery has copy, drop {
-        terminal_id: u64,
-        player: address,
-        query_type: u8,
-        timestamp: u64,
-    }
+/// Emitted when a player submits a query through GHOST.
+public struct GhostQuery has copy, drop {
+    terminal_obj_id: address,
+    player: address,
+    query_type: u8,
+    timestamp: u64,
+}
 
-    /// Emitted when a new terminal is registered.
-    public struct TerminalRegistered has copy, drop {
-        terminal_id: u64,
-        name: vector<u8>,
-        registered_by: address,
-        timestamp: u64,
-    }
+/// Emitted when a terminal is registered.
+public struct TerminalRegistered has copy, drop {
+    terminal_obj_id: address,
+    name: vector<u8>,
+    registered_by: address,
+    timestamp: u64,
+}
 
-    /// Emitted when a terminal is deactivated.
-    public struct TerminalDeactivated has copy, drop {
-        terminal_id: u64,
-        timestamp: u64,
-    }
+// ========== Admin: Setup ==========
 
-    // ========== Init ==========
+/// Register the GHOST extension on a Smart Storage Unit.
+/// The SSU owner calls this after deploying the SSU in-game.
+/// This authorizes the `GhostAuth` witness type on the SSU,
+/// enabling GHOST extension logic to interact with it.
+public fun register_extension(
+    storage_unit: &mut StorageUnit,
+    owner_cap: &OwnerCap<StorageUnit>,
+) {
+    storage_unit::authorize_extension<GhostAuth>(storage_unit, owner_cap);
+}
 
-    /// Module initializer — creates the shared GhostRegistry.
-    fun init(ctx: &mut TxContext) {
-        let registry = GhostRegistry {
-            id: object::new(ctx),
-            terminals: table::new(ctx),
-            total_activations: 0,
-            admin: tx_context::sender(ctx),
-        };
-        transfer::share_object(registry);
-    }
-
-    // ========== Admin functions ==========
-
-    /// Register a new GHOST terminal attached to an SSU.
-    /// Called by the deployer after publishing + deploying the SSU in-game.
-    public entry fun register_terminal(
-        registry: &mut GhostRegistry,
-        ssu_item_id: u64,
-        name: vector<u8>,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        assert!(tx_context::sender(ctx) == registry.admin, E_NOT_AUTHORIZED);
-        assert!(!table::contains(&registry.terminals, ssu_item_id), E_ALREADY_REGISTERED);
-
-        let now = sui::clock::timestamp_ms(clock);
-        let config = TerminalConfig {
-            ssu_item_id,
+/// Configure terminal metadata on the shared ExtensionConfig.
+public fun configure_terminal(
+    extension_config: &mut ExtensionConfig,
+    admin_cap: &AdminCap,
+    name: vector<u8>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    let now = clock.timestamp_ms();
+    extension_config.set_rule<TerminalConfigKey, TerminalConfig>(
+        admin_cap,
+        TerminalConfigKey {},
+        TerminalConfig {
             name: copy name,
             active: true,
             activation_count: 0,
             registered_at: now,
-        };
+        },
+    );
 
-        table::add(&mut registry.terminals, ssu_item_id, config);
+    event::emit(TerminalRegistered {
+        terminal_obj_id: ctx.sender(),
+        name,
+        registered_by: ctx.sender(),
+        timestamp: now,
+    });
+}
 
-        event::emit(TerminalRegistered {
-            terminal_id: ssu_item_id,
-            name,
-            registered_by: tx_context::sender(ctx),
-            timestamp: now,
-        });
-    }
+/// Deactivate the terminal.
+public fun deactivate_terminal(
+    extension_config: &mut ExtensionConfig,
+    admin_cap: &AdminCap,
+) {
+    assert!(
+        extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {}),
+        ENoTerminalConfig,
+    );
+    let cfg = extension_config.borrow_rule_mut<TerminalConfigKey, TerminalConfig>(
+        admin_cap,
+        TerminalConfigKey {},
+    );
+    cfg.active = false;
+}
 
-    /// Deactivate a terminal (admin only).
-    public entry fun deactivate_terminal(
-        registry: &mut GhostRegistry,
-        ssu_item_id: u64,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        assert!(tx_context::sender(ctx) == registry.admin, E_NOT_AUTHORIZED);
-        assert!(table::contains(&registry.terminals, ssu_item_id), E_TERMINAL_NOT_FOUND);
+// ========== Player interactions ==========
 
-        let config = table::borrow_mut(&mut registry.terminals, ssu_item_id);
-        config.active = false;
+/// Record a player activation at the GHOST terminal.
+/// Called by the dApp when a player opens the terminal (press F).
+/// activation_type: 0=opened, 1=query, 2=alert_acknowledged
+public entry fun activate(
+    extension_config: &mut ExtensionConfig,
+    admin_cap: &AdminCap,
+    activation_type: u8,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    assert!(
+        extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {}),
+        ENoTerminalConfig,
+    );
 
-        event::emit(TerminalDeactivated {
-            terminal_id: ssu_item_id,
-            timestamp: sui::clock::timestamp_ms(clock),
-        });
-    }
+    let cfg = extension_config.borrow_rule_mut<TerminalConfigKey, TerminalConfig>(
+        admin_cap,
+        TerminalConfigKey {},
+    );
+    assert!(cfg.active, ETerminalInactive);
+    cfg.activation_count = cfg.activation_count + 1;
 
-    // ========== Player interaction functions ==========
+    event::emit(GhostActivation {
+        terminal_obj_id: ctx.sender(),
+        player: ctx.sender(),
+        timestamp: clock.timestamp_ms(),
+        activation_type,
+    });
+}
 
-    /// Record a player activation at a GHOST terminal.
-    /// Called by the dApp when a player opens the terminal.
-    public entry fun activate(
-        registry: &mut GhostRegistry,
-        ssu_item_id: u64,
-        activation_type: u8,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        assert!(table::contains(&registry.terminals, ssu_item_id), E_TERMINAL_NOT_FOUND);
+/// Record a query from a player.
+/// query_type: 0=status, 1=threat, 2=route, 3=tutorial
+public entry fun submit_query(
+    extension_config: &ExtensionConfig,
+    query_type: u8,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    assert!(
+        extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {}),
+        ENoTerminalConfig,
+    );
 
-        let config = table::borrow_mut(&mut registry.terminals, ssu_item_id);
-        config.activation_count = config.activation_count + 1;
-        registry.total_activations = registry.total_activations + 1;
+    event::emit(GhostQuery {
+        terminal_obj_id: ctx.sender(),
+        player: ctx.sender(),
+        query_type,
+        timestamp: clock.timestamp_ms(),
+    });
+}
 
-        event::emit(GhostActivation {
-            terminal_id: ssu_item_id,
-            player: tx_context::sender(ctx),
-            timestamp: sui::clock::timestamp_ms(clock),
-            activation_type,
-        });
-    }
+/// Extension-authorized deposit: allow a player to deposit an item
+/// into the GHOST Terminal SSU's inventory via the extension auth.
+public fun ghost_deposit(
+    storage_unit: &mut StorageUnit,
+    character: &Character,
+    item: world::item::Item,
+    ctx: &mut TxContext,
+) {
+    storage_unit.deposit_item<GhostAuth>(
+        character,
+        item,
+        config::ghost_auth(),
+        ctx,
+    );
+}
 
-    /// Record a query from a player.
-    public entry fun submit_query(
-        registry: &mut GhostRegistry,
-        ssu_item_id: u64,
-        query_type: u8,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        assert!(table::contains(&registry.terminals, ssu_item_id), E_TERMINAL_NOT_FOUND);
+/// Extension-authorized withdraw: allow retrieval of items from
+/// the GHOST Terminal SSU via extension auth.
+public fun ghost_withdraw(
+    storage_unit: &mut StorageUnit,
+    character: &Character,
+    type_id: u64,
+    quantity: u32,
+    ctx: &mut TxContext,
+): world::item::Item {
+    storage_unit.withdraw_item<GhostAuth>(
+        character,
+        config::ghost_auth(),
+        type_id,
+        quantity,
+        ctx,
+    )
+}
 
-        event::emit(GhostQuery {
-            terminal_id: ssu_item_id,
-            player: tx_context::sender(ctx),
-            query_type,
-            timestamp: sui::clock::timestamp_ms(clock),
-        });
-    }
+// ========== View functions ==========
 
-    // ========== View functions ==========
+public fun terminal_name(extension_config: &ExtensionConfig): vector<u8> {
+    assert!(
+        extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {}),
+        ENoTerminalConfig,
+    );
+    extension_config.borrow_rule<TerminalConfigKey, TerminalConfig>(TerminalConfigKey {}).name
+}
 
-    /// Check if a terminal is registered and active.
-    public fun is_terminal_active(registry: &GhostRegistry, ssu_item_id: u64): bool {
-        if (!table::contains(&registry.terminals, ssu_item_id)) {
-            return false
-        };
-        let config = table::borrow(&registry.terminals, ssu_item_id);
-        config.active
-    }
+public fun is_active(extension_config: &ExtensionConfig): bool {
+    if (!extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {})) {
+        return false
+    };
+    extension_config.borrow_rule<TerminalConfigKey, TerminalConfig>(TerminalConfigKey {}).active
+}
 
-    /// Get total activations across all terminals.
-    public fun total_activations(registry: &GhostRegistry): u64 {
-        registry.total_activations
-    }
-
-    /// Get activation count for a specific terminal.
-    public fun terminal_activation_count(registry: &GhostRegistry, ssu_item_id: u64): u64 {
-        assert!(table::contains(&registry.terminals, ssu_item_id), E_TERMINAL_NOT_FOUND);
-        let config = table::borrow(&registry.terminals, ssu_item_id);
-        config.activation_count
-    }
+public fun activation_count(extension_config: &ExtensionConfig): u64 {
+    assert!(
+        extension_config.has_rule<TerminalConfigKey>(TerminalConfigKey {}),
+        ENoTerminalConfig,
+    );
+    extension_config
+        .borrow_rule<TerminalConfigKey, TerminalConfig>(TerminalConfigKey {})
+        .activation_count
 }
