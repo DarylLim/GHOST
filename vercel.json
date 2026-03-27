@@ -1,0 +1,4 @@
+{
+  "rootDirectory": "packages/dapp",
+  "framework": "nextjs"
+}
