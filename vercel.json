@@ -1,4 +1,6 @@
 {
-  "rootDirectory": "packages/dapp",
+  "buildCommand": "cd packages/dapp && npm install && npm run build",
+  "outputDirectory": "packages/dapp/.next",
+  "installCommand": "cd packages/dapp && npm install",
   "framework": "nextjs"
 }
